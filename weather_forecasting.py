@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler
 import torch
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import torch.nn as nn
@@ -23,16 +23,12 @@ def read_jsonl(file_path):
 # Daten laden
 df = read_jsonl('./data/luzern.jsonl')
 
-# Wetterbeschreibung in numerische Labels umwandeln
-label_encoder = LabelEncoder()
-df['weather_description'] = label_encoder.fit_transform(df['weather'].apply(lambda x: x[0]['description']))
+# Wähle relevante Spalten aus und erstelle DataFrame
+data = df[['main.temp', 'main.pressure', 'main.humidity']].values
 
-# Wähle relevante Spalten aus und extrahiere die Werte
-data = df[['main.temp', 'main.pressure', 'main.humidity', 'main.temp_min', 'main.temp_max', 'main.feels_like', 'clouds.all', 'wind.speed', 'wind.deg', 'weather_description']].values
-
-# Normalisieren der numerischen Daten
+# Normalisieren der Daten
 scaler = MinMaxScaler()
-data[:, :-1] = scaler.fit_transform(data[:, :-1])
+data_normalized = scaler.fit_transform(data)
 
 # Daten in Sequenzen umwandeln
 def create_sequences(data, seq_length, pred_length=24):
@@ -40,13 +36,13 @@ def create_sequences(data, seq_length, pred_length=24):
     labels = []
     for i in range(len(data) - seq_length - pred_length):
         seq = data[i:i + seq_length]
-        label = data[i + seq_length:i + seq_length + pred_length]
+        label = data[i + seq_length:i + seq_length + pred_length]  # Vorhersage für die nächsten 24 Stunden
         sequences.append(seq)
         labels.append(label)
     return np.array(sequences), np.array(labels)
 
 seq_length = 24
-sequences, labels = create_sequences(data, seq_length)
+sequences, labels = create_sequences(data_normalized, seq_length)
 
 # In Tensoren umwandeln
 sequences = torch.tensor(sequences, dtype=torch.float32)
@@ -68,19 +64,19 @@ class LSTMModel(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden_size, output_size * 24)
+        self.fc = nn.Linear(hidden_size, output_size * 24)  # Multipliziere mit 24 für 24-Stunden-Vorhersage
     
     def forward(self, x):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
         out, _ = self.lstm(x, (h0, c0))
         out = self.fc(out[:, -1, :])
-        out = out.view(out.size(0), 24, -1)
+        out = out.view(out.size(0), 24, -1)  # Forme die Ausgabe um
         return out
 
-input_size = 10  # Anzahl der Merkmale (Temp, Druck, Luftfeuchtigkeit, Temp_min, Temp_max, Feels_like, Clouds, Wind_speed, Wind_deg, Weather_description)
+input_size = 3  # Anzahl der Merkmale (Temp, Druck, Luftfeuchtigkeit)
 hidden_size = 50
-output_size = 10  # Vorhersage von Temp, Druck, Luftfeuchtigkeit, Temp_min, Temp_max, Feels_like, Clouds, Wind_speed, Wind_deg, Weather_description
+output_size = 3  # Vorhersage von Temp, Druck und Luftfeuchtigkeit
 num_layers = 2
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -115,11 +111,6 @@ for epoch in range(num_epochs):
 # Modell speichern
 torch.save(model.state_dict(), './lstm-weather.pth')
 
-# Label-Encoder und Scaler speichern
-import joblib
-joblib.dump(label_encoder, 'label_encoder.pkl')
-joblib.dump(scaler, 'scaler.pkl')
-
 # Modell laden und evaluieren
 model.load_state_dict(torch.load('./lstm-weather.pth'))
 model.eval()
@@ -136,25 +127,11 @@ with torch.no_grad():
 test_loss /= len(test_loader)
 print(f'Test Loss: {test_loss:.4f}')
 
-# Beispielhafte Vorhersage für 6, 12 und 24 Stunden
-def make_prediction(model, sequence, label_encoder):
-    model.eval()
-    with torch.no_grad():
-        sequence = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0).to(device)
-        prediction = model(sequence)
-        prediction = prediction.squeeze(0).cpu().numpy()
-        # Umwandeln der numerischen Labels in Wetterbeschreibung
-        weather_descriptions = label_encoder.inverse_transform(prediction[:, -1].astype(int))
-        return prediction, weather_descriptions
-
-example_sequence = sequences[0].cpu().numpy()
-pred_6h, weather_6h = make_prediction(model, example_sequence[:6], label_encoder)
-pred_12h, weather_12h = make_prediction(model, example_sequence[:12], label_encoder)
-pred_24h, weather_24h = make_prediction(model, example_sequence, label_encoder)
-
-print(f'6 Stunden Vorhersage: {pred_6h}, Wetter: {weather_6h}')
-print(f'12 Stunden Vorhersage: {pred_12h}, Wetter: {weather_12h}')
-print(f'24 Stunden Vorhersage: {pred_24h}, Wetter: {weather_24h}')
+# Beispielhafte Vorhersage
+with torch.no_grad():
+    example_data = sequences[0].unsqueeze(0).to(device)  # Beispielsequenz
+    prediction = model(example_data)
+    print(f'Predicted: {prediction.cpu().numpy()}, Actual: {labels[0].cpu().numpy()}')
 
 # Speichern des Modells als safetensors
 safetensors.torch.save_file(model.state_dict(), 'lstm-weather.safetensors')
