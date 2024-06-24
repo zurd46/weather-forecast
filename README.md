@@ -19,8 +19,9 @@ This project demonstrates the use of a Long Short-Term Memory (LSTM) neural netw
 - torch
 - safetensors
 - joblib
+- gradio
 
 You can install the required dependencies using the following command:
 
 ```bash
-pip install pandas numpy scikit-learn torch safetensors joblib
+pip install pandas numpy scikit-learn torch safetensors joblib gradio
