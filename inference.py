@@ -1,88 +1,124 @@
+import requests
 import pandas as pd
 import numpy as np
 import torch
 import gradio as gr
 import joblib
-from torch.utils.data import DataLoader, TensorDataset, random_split
-import torch.nn as nn
-import torch.optim as optim
+import onnxruntime as ort
+from sklearn.preprocessing import MinMaxScaler
 
-# Modelldefinition
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers):
-        super(LSTMModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden_size, output_size * 24)
+# OpenWeatherMap API-Schlüssel (ersetzen Sie durch Ihren eigenen Schlüssel)
+API_KEY = 'your-api-key'
+
+# Funktion zum Abrufen der aktuellen Temperatur von Luzern
+def get_current_temperature(city='Luzern', country='CH'):
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={city},{country}&appid={API_KEY}&units=metric"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        return data['main']['temp']
+    else:
+        raise ValueError(f"Fehler beim Abrufen der Wetterdaten: {response.status_code}")
+
+# Funktion zum Abrufen der aktuellen Wetterdaten von Luzern
+def get_current_weather(city='Luzern', country='CH'):
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={city},{country}&appid={API_KEY}&units=metric"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        return {
+            'temp': data['main']['temp'],
+            'pressure': data['main']['pressure'],
+            'humidity': data['main']['humidity'],
+            'clouds': data['clouds']['all'],
+            'wind_speed': data['wind']['speed'],
+        }
+    else:
+        raise ValueError(f"Fehler beim Abrufen der Wetterdaten: {response.status_code}")
+
+# Funktion zur Vorhersage mit ONNX-Modellen
+def make_prediction(sequence, model_path):
+    input_size = sequence.shape[1]
+    sequence = scaler.transform(sequence.reshape(-1, input_size))
+    sequence = np.tile(sequence, (24, 1)).astype(np.float32)  # Sicherstellen, dass die Sequenz die richtige Länge hat
+    sequence = np.expand_dims(sequence, axis=0)  # Hinzufügen einer Batch-Dimension
     
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-        out = out.view(out.size(0), 24, -1)
-        return out
+    session = ort.InferenceSession(model_path)
+    inputs = {session.get_inputs()[0].name: sequence}
+    pred = session.run(None, inputs)[0]
+    
+    pred = scaler.inverse_transform(pred.reshape(-1, input_size))
+    return pred
 
-# Lade das trainierte Modell
-input_size = 10
-hidden_size = 50
-output_size = 10
-num_layers = 2
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = LSTMModel(input_size, hidden_size, output_size, num_layers).to(device)
-model.load_state_dict(torch.load('lstm-weather.pth', map_location=device))
-model.eval()
-
-# Lade LabelEncoder und Scaler
-label_encoder = joblib.load('label_encoder.pkl')
-scaler = joblib.load('scaler.pkl')
-
-# Funktion zur Vorhersage
-def make_prediction(sequence):
-    sequence = np.array(sequence).reshape(-1, 10)
-    sequence[:, :-1] = scaler.transform(sequence[:, :-1])
-    sequence = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0).to(device)
-    with torch.no_grad():
-        prediction = model(sequence)
-    prediction = prediction.squeeze(0).cpu().numpy()
-    prediction[:, :-1] = scaler.inverse_transform(prediction[:, :-1])
-    weather_descriptions = label_encoder.inverse_transform(prediction[:, -1].astype(int))
-    return prediction, weather_descriptions
+# Lade den Scaler
+scaler = joblib.load('model/scaler.save')
 
 # Gradio-Interface
-def forecast_weather(temp, pressure, humidity, temp_min, temp_max, feels_like, clouds, wind_speed, wind_deg, weather_desc):
+def forecast_weather():
+    # Erhalte die aktuellen Wetterdaten von Luzern
+    current_weather = get_current_weather()
+    
     # Erstelle die Eingabesequenz
-    weather_desc_encoded = label_encoder.transform([weather_desc])[0]
-    sequence = [[temp, pressure, humidity, temp_min, temp_max, feels_like, clouds, wind_speed, wind_deg, weather_desc_encoded]]
-
+    sequence = np.array([[
+        current_weather['temp'],
+        current_weather['pressure'],
+        current_weather['humidity'],
+        current_weather['clouds'],
+        current_weather['wind_speed']
+    ]])
+    
     # Vorhersagen
-    pred_6h, weather_6h = make_prediction(sequence * 6)
-    pred_12h, weather_12h = make_prediction(sequence * 12)
-    pred_24h, weather_24h = make_prediction(sequence * 24)
+    pred_3h = make_prediction(sequence, 'model/lstm_model_3h.onnx')[-1]
+    pred_6h = make_prediction(sequence, 'model/lstm_model_6h.onnx')[-1]
+    pred_12h = make_prediction(sequence, 'model/lstm_model_12h.onnx')[-1]
+    pred_24h = make_prediction(sequence, 'model/lstm_model_24h.onnx')[-1]
+    
+    # Aktuelle Werte
+    current_temp = current_weather['temp']
 
     # Ergebnis formatieren
     results = {
-        "6 Stunden Vorhersage": f'{pred_6h}, Wetter: {weather_6h}',
-        "12 Stunden Vorhersage": f'{pred_12h}, Wetter: {weather_12h}',
-        "24 Stunden Vorhersage": f'{pred_24h}, Wetter: {weather_24h}'
+        "3 Stunden Vorhersage": {
+            "Temperatur": f'{current_temp + pred_3h[0]:.2f} Grad Celsius',
+            "Druck": f'{pred_3h[1]:.2f} hPa',
+            "Luftfeuchtigkeit": f'{pred_3h[2]:.2f} %',
+            "Bewölkung": f'{pred_3h[3]:.2f} %',
+            "Windgeschwindigkeit": f'{pred_3h[4]:.2f} m/s'
+        },
+        "6 Stunden Vorhersage": {
+            "Temperatur": f'{current_temp + pred_6h[0]:.2f} Grad Celsius',
+            "Druck": f'{pred_6h[1]:.2f} hPa',
+            "Luftfeuchtigkeit": f'{pred_6h[2]:.2f} %',
+            "Bewölkung": f'{pred_6h[3]:.2f} %',
+            "Windgeschwindigkeit": f'{pred_6h[4]:.2f} m/s'
+        },
+        "12 Stunden Vorhersage": {
+            "Temperatur": f'{current_temp + pred_12h[0]:.2f} Grad Celsius',
+            "Druck": f'{pred_12h[1]:.2f} hPa',
+            "Luftfeuchtigkeit": f'{pred_12h[2]:.2f} %',
+            "Bewölkung": f'{pred_12h[3]:.2f} %',
+            "Windgeschwindigkeit": f'{pred_12h[4]:.2f} m/s'
+        },
+        "24 Stunden Vorhersage": {
+            "Temperatur": f'{current_temp + pred_24h[0]:.2f} Grad Celsius',
+            "Druck": f'{pred_24h[1]:.2f} hPa',
+            "Luftfeuchtigkeit": f'{pred_24h[2]:.2f} %',
+            "Bewölkung": f'{pred_24h[3]:.2f} %',
+            "Windgeschwindigkeit": f'{pred_24h[4]:.2f} m/s'
+        }
     }
     return results
 
-inputs = [
-    gr.inputs.Number(label="Temperatur"),
-    gr.inputs.Number(label="Druck"),
-    gr.inputs.Number(label="Luftfeuchtigkeit"),
-    gr.inputs.Number(label="Min Temperatur"),
-    gr.inputs.Number(label="Max Temperatur"),
-    gr.inputs.Number(label="Gefühlte Temperatur"),
-    gr.inputs.Number(label="Bewölkung (%)"),
-    gr.inputs.Number(label="Windgeschwindigkeit"),
-    gr.inputs.Number(label="Windrichtung (Grad)"),
-    gr.inputs.Textbox(label="Wetterbeschreibung")
-]
+gr.Interface(
+    fn=forecast_weather, 
+    inputs=[], 
+    outputs=gr.JSON(label="Vorhersagen"), 
+    title="Wettervorhersage", 
+    description="Vorhersage des Wetters für die nächsten 3, 6, 12 und 24 Stunden."
+).launch()
 
-outputs = gr.outputs.JSON(label="Vorhersagen")
-
-gr.Interface(fn=forecast_weather, inputs=inputs, outputs=outputs, title="Wettervorhersage", description="Vorhersage des Wetters für die nächsten 6, 12 und 24 Stunden.").launch()
+# Ausgabe der Vorhersagen mit der aktuellen Temperatur
+print(f'Vorhersage für 3 Stunden: Temperatur: {current_temp + pred_3h[0]:.2f} Grad Celsius, Druck: {pred_3h[1]:.2f} hPa, Luftfeuchtigkeit: {pred_3h[2]:.2f} %, Bewölkung: {pred_3h[3]:.2f} %, Windgeschwindigkeit: {pred_3h[4]:.2f} m/s')
+print(f'Vorhersage für 6 Stunden: Temperatur: {current_temp + pred_6h[0]:.2f} Grad Celsius, Druck: {pred_6h[1]:.2f} hPa, Luftfeuchtigkeit: {pred_6h[2]:.2f} %, Bewölkung: {pred_6h[3]:.2f} %, Windgeschwindigkeit: {pred_6h[4]:.2f} m/s')
+print(f'Vorhersage für 12 Stunden: Temperatur: {current_temp + pred_12h[0]:.2f} Grad Celsius, Druck: {pred_12h[1]:.2f} hPa, Luftfeuchtigkeit: {pred_12h[2]:.2f} %, Bewölkung: {pred_12h[3]:.2f} %, Windgeschwindigkeit: {pred_12h[4]:.2f} m/s')
+print(f'Vorhersage für 24 Stunden: Temperatur: {current_temp + pred_24h[0]:.2f} Grad Celsius, Druck: {pred_24h[1]:.2f} hPa, Luftfeuchtigkeit: {pred_24h[2]:.2f} %, Bewölkung: {pred_24h[3]:.2f} %, Windgeschwindigkeit: {pred_24h[4]:.2f} m/s')
